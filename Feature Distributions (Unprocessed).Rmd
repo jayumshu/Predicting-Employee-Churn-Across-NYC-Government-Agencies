@@ -1,0 +1,137 @@
+---
+title: "Feature Distributions (Unprocessed)"
+output: html_document
+date: "2025-05-09"
+---
+
+```{r}
+length(unique(payroll_final_clean$emp_key))
+
+
+#FIRST, A GENERAL UNDERSTANDING OF NAs ACROSS COLUMNS 
+payroll_final_clean %>%
+  summarise(across(everything(), ~ mean(is.na(.)), .names = "pct_missing_{col}")) %>%
+  pivot_longer(everything(), names_to="field", values_to="pct_missing") %>%
+  filter(pct_missing > 0) %>%
+  arrange(desc(pct_missing))
+#8% are missing churn_flag but those come from 2024 
+#Don't care about missing_payroll_number 
+#Nothing else has any NAs
+
+
+#UNDERSTANDING THE DISTRIBUTIONS FOR MY NUMERIC COLUMNS 
+num_vars <- c(
+  "regular_gross_paid",
+  "ot_hours",
+  "total_ot_paid",
+  "total_other_pay",
+  "n_entries",
+  "n_titles"
+)
+
+# 1) Summary statistics
+summary_stats <- payroll_final_clean %>%
+  select(all_of(num_vars)) %>%
+  summarise(across(
+    everything(),
+    list(
+      mean   = ~mean(.x,    na.rm = TRUE),
+      median = ~median(.x,  na.rm = TRUE),
+      sd     = ~sd(.x,      na.rm = TRUE),
+      p25    = ~quantile(.x, .25, na.rm = TRUE),
+      p75    = ~quantile(.x, .75, na.rm = TRUE)
+    ),
+    .names = "{.col}_{.fn}"
+  ))
+#print(summary_stats)
+
+#For report, use histograms and not the summary_stats
+# 2) Histograms
+for (var in num_vars) {
+  p <- ggplot(payroll_final_clean, aes_string(var)) +
+    geom_histogram() +
+    labs(
+      title = paste("Distribution of", var),
+      x     = var,
+      y     = "Count"
+    ) +
+    theme_minimal()
+  print(p)
+}
+#ot_hours, total_ot_paid -> right skew
+#The vast majority of n_entries and n_titles are 1 
+
+#Check for negative values in total_other_pay
+neg_other <- payroll_final_clean %>%
+  filter(total_other_pay < 0)
+print(neg_other)
+#Around 8,000 entries for which total_other_pay is negative 
+#The majority of these are churned 
+
+
+#UNDERSTANDING THE LEVELS FOR MY CATEGORICAL FEATURES 
+payroll_final_clean %>%
+  summarise(
+    n_agencies = n_distinct(agency_name),
+    n_boroughs = n_distinct(work_location_borough),
+    n_titles   = n_distinct(title_description)
+  )
+#3 agencies (as expected), 6 boroughs, 347 titles 
+
+
+#OUTLIER DETECTION: checking for any extreme pay or entry counts that could skew models 
+#sum(!is.na(payroll_final_clean$regular_gross_paid))
+#str(payroll_final_clean$regular_gross_paid)
+ggplot(
+  payroll_final_clean %>% filter(is.finite(regular_gross_paid)),
+  aes(x = "", y = regular_gross_paid)
+) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Distribution of Regular Gross Pay",
+    x     = "",
+    y     = "Regular Gross Pay"
+  ) +
+  theme_minimal()
+
+ggplot(
+  payroll_final_clean %>% filter(is.finite(ot_hours)),
+  aes(x = "", y = ot_hours)
+) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Distribution of Overtime Hours",
+    x     = "",
+    y     = "Overtime Hours"
+  ) +
+  theme_minimal()
+
+ggplot(
+  payroll_final_clean %>% filter(is.finite(total_ot_paid)),
+  aes(x = "", y = total_ot_paid)
+) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Distribution of Overtime Pay",
+    x     = "",
+    y     = "Overtime Pay"
+  ) +
+  theme_minimal()
+
+ggplot(
+  payroll_final_clean %>% filter(is.finite(total_other_pay)),
+  aes(x = "", y = total_other_pay)
+) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Distribution of Other Pay",
+    x     = "",
+    y     = "Other Pay"
+  ) +
+  theme_minimal()
+```
+

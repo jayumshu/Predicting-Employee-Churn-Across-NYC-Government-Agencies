@@ -1,0 +1,56 @@
+---
+title: "Loading Data and Packages"
+output: html_document
+date: "2025-05-09"
+---
+
+```{r}
+library(httr)
+library(dplyr)
+library(RSocrata)
+library(ggplot2)
+library(tidyr)
+library(lubridate)
+library(tidytext)
+library(stringr)
+library(purrr)
+library(data.table)
+library(stringdist)
+library(readr)
+library(jsonlite)
+library(censusapi)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+library(reshape2)
+library(data.table)
+library(scales)
+library(zoo)
+library(MLmetrics)
+library(survival)
+library(ranger)
+```
+
+```{r}
+#I registered an account to query the data from NYC OpenData 311. To reproduce results, obtain your own login credentials via 
+#https://portal.311.nyc.gov/article/?kanumber=KA-02893
+
+app_token <- "XXX"
+email     <- "XXX"
+password  <- "XXX"
+
+base_csv <- "https://data.cityofnewyork.us/resource/k397-673e.csv"
+qry      <- paste0(base_csv, 
+                   "?$limit=9000000",
+                   "&$$app_token=", app_token)
+
+curl_cmd <- sprintf(
+  "curl -u '%s:%s' -H 'X-App-Token: %s' '%s'",
+   email, password, app_token, qry
+)
+
+payroll_df_full <- fread(cmd = curl_cmd)
+```
+

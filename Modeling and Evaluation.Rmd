@@ -1,0 +1,440 @@
+---
+title: "Modeling and Evaluation"
+output: html_document
+date: "2025-05-09"
+---
+
+```{r}
+payroll_model_df <- payroll_final_clean %>%
+  filter(fiscal_year < 2024)
+payroll_model_df <- payroll_model_df %>%
+  filter(!is.na(churn_flag))
+
+payroll_model_df <- payroll_model_df %>%
+  mutate(churn_flag = factor(churn_flag),
+         ot_pay_quintile = as.integer(ot_pay_quintile))
+
+payroll_model_df <- payroll_model_df %>%
+  select("emp_key", "fiscal_year", "agency_name", "work_location_borough", "pay_basis", "churn_flag", 
+         "seniority", "ot_change_signed_log", "ot_vs_ma3_prev", "hourly_change_pos_log", "ot_pay_quintile",
+         "other_pay_negative")
+
+df <- payroll_model_df %>%
+#  filter(fiscal_year < 2024) %>%            # drop 2024
+  mutate(
+    # 2-level factor outcome for caret
+    churn_flag = factor(churn_flag, levels = c(0,1), labels = c("No","Yes")),
+    # set reference levels
+    work_borough_location = relevel(work_location_borough, "MANHATTAN"),
+    agency_name           = relevel(agency_name, "DEPARTMENT OF CORRECTION"),
+    pay_basis             = relevel(pay_basis, "per Annum"),
+    other_pay_negative    = factor(other_pay_negative)
+  )
+
+
+df %>%
+  summarise(across(
+    everything(),
+    ~ sum(is.na(.)),
+    .names = "n_na_{.col}"
+  ))
+```
+
+RANDOM FOREST MODEL AND COMPARISON AGAINST BASELINE SURVIVAL MODEL (not included in paper)
+
+```{r}
+# ──────────────────────────────────────────────────────────────────────────────
+# 0) Assume you’ve already built `df` with:
+#   • churn_flag as factor("No","Yes")
+#   • all releveled factors (MANHATTAN, per Annum, etc.)
+#   • numeric features (seniority, hourly_change_pos_log, …)
+#   • fiscal_year column
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 1) Outer years 2019–2023
+test_years <- 2019:2023
+
+# 2) Inner CV: 4-fold for Recall
+ctrl <- trainControl(
+  method           = "cv",
+  number           = 4,
+  summaryFunction  = prSummary,
+  classProbs       = TRUE,
+  savePredictions  = "final"
+)
+
+# 3) Thinned RF grid + tiny forest
+rf_grid <- expand.grid(
+  mtry          = c(2, 4),
+  splitrule     = "gini",
+  min.node.size = 3
+)
+
+results <- tibble(model = character(),
+                  test_year = integer(),
+                  Accuracy  = double(),
+                  Precision = double(),
+                  Recall    = double())
+
+for (Y in test_years) {
+  train_data <- df %>% filter(fiscal_year <  Y)
+  test_data  <- df %>% filter(fiscal_year == Y)
+
+  set.seed(10 + Y)
+  rf_fit <- train(
+    churn_flag ~ agency_name +
+                  work_location_borough +
+                  pay_basis +
+                  other_pay_negative +
+                  seniority +
+                  hourly_change_pos_log +
+                  ot_change_signed_log +
+                  ot_pay_quintile,
+    data       = train_data,
+    method     = "ranger",
+    metric     = "Recall",
+    trControl  = ctrl,
+    tuneGrid   = rf_grid,
+    num.trees  = 50,           # only 50 trees
+    importance = "impurity"
+  )
+
+  # threshold–0.30 predictions
+  probs_rf <- predict(rf_fit, test_data, type = "prob")[, "Yes"]
+  pred_rf  <- factor(if_else(probs_rf > .30, "Yes", "No"),
+                     levels = c("No","Yes"))
+
+  cm_rf <- confusionMatrix(pred_rf, test_data$churn_flag, positive = "Yes")
+  results <- results %>% add_row(
+    model     = "ranger_rf",
+    test_year = Y,
+    Accuracy  = as.numeric(cm_rf$overall["Accuracy"]),
+    Precision = as.numeric(cm_rf$byClass["Precision"]),
+    Recall    = as.numeric(cm_rf$byClass["Recall"])
+  )
+
+  # pure‐baseline Cox (no predictors)
+  cox_fit <- coxph(Surv(seniority, churn_flag=="Yes") ~ 1,
+                   data = train_data)
+
+  pred_cox <- factor(rep("Yes", nrow(test_data)),
+                     levels = c("No","Yes"))
+  cm_cox <- confusionMatrix(pred_cox, test_data$churn_flag, positive = "Yes")
+  results <- results %>% add_row(
+    model     = "coxph",
+    test_year = Y,
+    Accuracy  = as.numeric(cm_cox$overall["Accuracy"]),
+    Precision = as.numeric(cm_cox$byClass["Precision"]),
+    Recall    = as.numeric(cm_cox$byClass["Recall"])
+  )
+}
+```
+
+ROC CURVE (included in paper)
+
+```{r}
+# ─── 0) Define your “thinned” RF tuning grid (if you haven’t already) ─────────
+rf_grid <- expand.grid(
+  mtry          = c(2, 4),
+  splitrule     = "gini",
+  min.node.size = 3
+)
+
+# ─── 1) Extract train/test for 2023 ───────────────────────────────────────────
+train_23 <- df %>% filter(fiscal_year <  2023)
+test_23  <- df %>% filter(fiscal_year == 2023)
+
+# ─── 2) Re-train RF with that grid + 4-fold CV for Recall ────────────────────
+set.seed(2023)
+rf_fit_23 <- train(
+  churn_flag ~ agency_name +
+                work_location_borough +
+                pay_basis +
+                other_pay_negative +
+                seniority +
+                hourly_change_pos_log +
+                ot_change_signed_log +
+                ot_pay_quintile,
+  data       = train_23,
+  method     = "ranger",
+  metric     = "Recall",
+  trControl  = trainControl(
+                 method          = "cv",
+                 number          = 4,
+                 classProbs      = TRUE,
+                 summaryFunction = prSummary
+               ),
+  tuneGrid   = rf_grid,
+  num.trees  = 50,           # only 50 trees per forest
+  importance = "impurity"    # for later inspection
+)
+
+# ─── 3) Predict probabilities on 2023 ─────────────────────────────────────────
+probs_23 <- predict(rf_fit_23, test_23, type = "prob")[, "Yes"]
+
+# ─── 4) ROC curve ─────────────────────────────────────────────────────────────
+roc_23 <- roc(
+  response  = test_23$churn_flag,
+  predictor = probs_23,
+  levels    = c("No","Yes")
+)
+plot(roc_23, col = "#2C3E50", lwd = 2,
+     main = "RF (50 trees) ROC Curve on 2023 Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# ─── 5) AUC & best‐threshold ─────────────────────────────────────────────────
+auc_val     <- auc(roc_23)
+best_coords <- coords(roc_23, x = "best", best.method = "closest.topleft")
+
+best_thr     <- best_coords["threshold"]
+best_sens    <- best_coords["sensitivity"]   # = recall
+best_spec    <- best_coords["specificity"]
+
+# Print out your chosen threshold and its performance
+cat(glue::glue(
+  "AUC = {round(auc_val, 3)}\n",
+  "Best threshold = {round(best_thr, 3)} → ",
+  "Recall = {round(best_sens, 3)}, ",
+  "Specificity = {round(best_spec, 3)}\n"
+))
+#0.256
+```
+
+ACTUAL FINAL MODEL CROSS VALIDATION AND COMPARISON AGAINST RANDOM GUESSING MODEL (included in paper)
+
+```{r}
+# 1) Outer years 2019–2023
+test_years <- 2019:2023
+
+# 2) Inner CV for RF: 4‐fold, optimizing Recall
+ctrl <- trainControl(
+  method           = "cv",
+  number           = 4,
+  summaryFunction  = prSummary,
+  classProbs       = TRUE,
+  savePredictions  = "final"
+)
+
+# 3) Thinned RF grid + small forest
+rf_grid <- expand.grid(
+  mtry          = c(2, 4),
+  splitrule     = "gini",
+  min.node.size = 3
+)
+
+results <- tibble(
+  model     = character(),
+  test_year = integer(),
+  Accuracy  = double(),
+  Precision = double(),
+  Recall    = double()
+)
+
+for (Y in test_years) {
+  train_data <- df %>% filter(fiscal_year <  Y)
+  test_data  <- df %>% filter(fiscal_year == Y)
+
+  # ——— Train RF ——————————————————————————————————————————————
+  set.seed(100 + Y)
+  rf_fit <- train(
+    churn_flag ~ agency_name +
+                  work_location_borough +
+                  pay_basis +
+                  other_pay_negative +
+                  seniority +
+                  hourly_change_pos_log +
+                  ot_change_signed_log +
+                  ot_pay_quintile,
+    data       = train_data,
+    method     = "ranger",
+    metric     = "Recall",
+    trControl  = ctrl,
+    tuneGrid   = rf_grid,
+    num.trees  = 50,
+    importance = "impurity"
+  )
+
+  # RF predictions at 0.30
+  probs_rf <- predict(rf_fit, test_data, type = "prob")[, "Yes"]
+  pred_rf  <- factor(
+    if_else(probs_rf > 0.30, "Yes", "No"),
+    levels = c("No","Yes")
+  )
+  cm_rf <- confusionMatrix(pred_rf, test_data$churn_flag, positive = "Yes")
+  results <- results %>% add_row(
+    model     = "ranger_rf",
+    test_year = Y,
+    Accuracy  = as.numeric(cm_rf$overall["Accuracy"]),
+    Precision = as.numeric(cm_rf$byClass["Precision"]),
+    Recall    = as.numeric(cm_rf$byClass["Recall"])
+  )
+
+  # ——— Random‐guessing baseline —————————————————————————————
+  set.seed(200 + Y)  # ensure reproducibility
+  churn_rate <- mean(train_data$churn_flag == "Yes")
+  pred_rand  <- factor(
+    sample(
+      c("Yes","No"),
+      size    = nrow(test_data),
+      replace = TRUE,
+      prob    = c(churn_rate, 1 - churn_rate)
+    ),
+    levels = c("No","Yes")
+  )
+  cm_rand <- confusionMatrix(pred_rand, test_data$churn_flag, positive = "Yes")
+  results <- results %>% add_row(
+    model     = "random_baseline",
+    test_year = Y,
+    Accuracy  = as.numeric(cm_rand$overall["Accuracy"]),
+    Precision = as.numeric(cm_rand$byClass["Precision"]),
+    Recall    = as.numeric(cm_rand$byClass["Recall"])
+  )
+}
+
+
+# 1) Pivot your results so Accuracy/Precision/Recall live in one column
+results_long <- results %>%
+  pivot_longer(
+    cols      = c(Accuracy, Precision, Recall),
+    names_to  = "Metric",
+    values_to = "Value"
+  )
+
+# ——— A) Separate bar charts ——
+plot_metric <- function(metric_name) {
+  ggplot(
+    filter(results_long, Metric == metric_name),
+    aes(
+      x    = factor(test_year),
+      y    = Value,
+      fill = model
+    )
+  ) +
+    geom_col(position = position_dodge(width = 0.8)) +
+    labs(
+      title = paste0(metric_name, " by Test Year & Model"),
+      x     = "Test Year",
+      y     = metric_name,
+      fill  = "Model"
+    ) +
+    theme_minimal()
+}
+
+plot_metric("Accuracy")
+plot_metric("Precision")
+plot_metric("Recall")
+```
+
+USE OF FINAL MODEL ON 2024 DATA (included in paper)
+
+```{r}
+df_all <- payroll_final_clean %>%
+  # convert churn_flag & ot_pay_quintile to the right types
+  mutate(
+    churn_flag      = factor(churn_flag, levels = c(0,1)),
+    ot_pay_quintile = as.integer(ot_pay_quintile)
+  ) %>%
+  # pick only the columns your model needs + emp_key, fiscal_year
+  select(
+    emp_key,
+    fiscal_year,
+    agency_name,
+    work_location_borough,
+    pay_basis,
+    churn_flag,
+    seniority,
+    ot_change_signed_log,
+    ot_vs_ma3_prev,
+    hourly_change_pos_log,
+    ot_pay_quintile,
+    other_pay_negative
+  ) %>%
+  # re‐factor churn_flag for caret & set your reference levels
+  mutate(
+    churn_flag           = factor(churn_flag, levels = c(0,1), labels = c("No","Yes")),
+    work_borough_location = relevel(work_location_borough, "MANHATTAN"),
+    agency_name           = relevel(agency_name,           "DEPARTMENT OF CORRECTION"),
+    pay_basis             = relevel(pay_basis,             "per Annum"),
+    other_pay_negative    = factor(other_pay_negative)
+  )
+
+
+#Just using the 0.256 ideal threshold from when we trained on 2015-2022 data and tested on 2023
+# 1) Define the thinned RF grid
+rf_grid <- expand.grid(
+  mtry          = c(2, 4),
+  splitrule     = "gini",
+  min.node.size = 3
+)
+
+# 2) Control for 4-fold CV tuning on Recall
+ctrl_final <- trainControl(
+  method           = "cv",
+  number           = 4,
+  summaryFunction  = prSummary,
+  classProbs       = TRUE,
+  savePredictions  = "final"
+)
+
+# 3) Train rf_final on 2015–2023
+set.seed(2029)
+rf_final <- train(
+  churn_flag ~ agency_name +
+                work_borough_location +
+                pay_basis +
+                other_pay_negative +
+                seniority +
+                hourly_change_pos_log +
+                ot_change_signed_log +
+                ot_pay_quintile,
+  data       = df_all %>% filter(fiscal_year < 2024),
+  method     = "ranger",
+  metric     = "Recall",
+  trControl  = ctrl_final,
+  tuneGrid   = rf_grid,
+  num.trees  = 50,
+  importance = "impurity"
+)
+
+print(rf_final$bestTune)   # see which mtry/min.node.size was chosen
+
+# 4) Slice out 2024 and get predictions
+df_2024 <- df_all %>% filter(fiscal_year == 2024)
+
+# 4a) predicted churn probabilities
+probs_2024 <- predict(rf_final, df_2024, type = "prob")[, "Yes"]
+
+# 4b) binary churn predictions at threshold = 0.256
+pred_2024 <- factor(
+  if_else(probs_2024 > 0.256, "Yes", "No"),
+  levels = c("No","Yes")
+)
+
+df_2024 <- df_2024 %>%
+  mutate(
+    p_churn    = probs_2024,
+    pred_churn = pred_2024
+  )
+
+# 5) Compute overall % churn predicted
+pct_churn_2024 <- mean(df_2024$pred_churn == "Yes")
+cat("Overall % predicted to churn in 2024:", round(100 * pct_churn_2024, 1), "%\n")
+
+# 6) % churn by agency
+pct_by_agency <- df_2024 %>%
+  group_by(agency_name) %>%
+  summarise(
+    pct_churn = mean(pred_churn == "Yes") * 100
+  )
+
+print(pct_by_agency)
+
+
+rf_imp <- varImp(rf_final, scale = FALSE)
+print(rf_imp)
+```
+
+
+
+
+

@@ -1,0 +1,342 @@
+---
+title: "Data Cleaning and Exploration"
+output: html_document
+date: "2025-05-09"
+---
+
+```{r}
+payroll_df_full <- payroll_df_full %>%
+  # drop rows with NA in first or last name…
+  filter(!is.na(first_name), !is.na(last_name)) %>%
+  # …and also drop rows where they’re just empty or whitespace
+  filter(str_trim(first_name) != "", str_trim(last_name) != "")
+
+#CREATING employee key
+payroll_df_full <- payroll_df_full %>%
+  mutate(
+    emp_key = str_c(
+      str_to_upper(str_trim(first_name)),
+      str_to_upper(str_trim(coalesce(mid_init, ""))),
+      str_to_upper(str_trim(last_name)),
+      str_to_upper(str_trim(agency_name)),
+      str_to_upper(str_trim(work_location_borough)),
+      sep = "|"
+    )
+  )
+
+#Duplicate keys
+dup_empkey_year <- payroll_df_full %>%
+  group_by(emp_key, fiscal_year) %>%
+  filter(n() > 1) %>%
+  summarise(
+    job_titles  = paste(unique(title_description), collapse = " | "),
+    total_rows  = n(),
+    n_titles    = n_distinct(title_description),
+    .groups     = "drop"
+  ) %>%
+  arrange(desc(n_titles), desc(total_rows))
+head(dup_empkey_year)
+
+
+setDT(payroll_df_full)
+
+bad_keys <- payroll_df_full[
+  , .N, by = .(emp_key, fiscal_year)
+][
+  N > 5, unique(emp_key)
+]
+
+# filter out all rows for those keys
+payroll_df_full <- payroll_df_full[!emp_key %in% bad_keys]
+
+payroll_df_full[
+  , `:=`(
+      n_entries    = .N,                     # total rows per person–year
+      n_titles     = uniqueN(title_description),  # distinct titles
+      primary_title = {                      # most‐frequent or sole title
+        if (.N == 1L) {
+          title_description[1L]
+        } else {
+          t <- title_description
+          u <- unique(t)
+          u[ which.max( tabulate(match(t, u)) ) ]
+        }
+      }
+    ),
+  by = .(emp_key, fiscal_year)
+]
+
+payroll_df_full <- payroll_df_full[
+  , .SD[1],      # take the first row within each group
+  by = .(emp_key, fiscal_year)
+]
+
+
+#DEFINING CHURN
+# A) Build the distinct person-year roster
+df_keys <- unique(payroll_df_full[, .(emp_key, fiscal_year)])
+
+# B) Compute the global max year (2024) from that roster
+max_year <- max(df_keys$fiscal_year)
+
+df_keys[
+  , `:=`(
+      key_curr = paste(emp_key,       fiscal_year,     sep="|"),
+      key_next = paste(emp_key,       fiscal_year + 1, sep="|")
+    )
+]
+
+df_keys[
+  , present_next := key_next %in% key_curr
+]
+
+df_keys[
+  , churn_flag := fifelse(
+      fiscal_year == max_year,      # final year → NA
+      NA_integer_,
+      fifelse(
+        present_next,                # shows up in t+1 → stayed→0
+        0L,
+        1L                           # otherwise → churned→1
+      )
+    )
+]
+
+
+#REJOINING WITH OVERALL DATAFRAME
+payroll_with_churn <- payroll_df_full[
+  df_keys[, .(emp_key, fiscal_year, churn_flag)],
+  on = .(emp_key, fiscal_year)
+]
+
+
+#EXCLUDING 2014
+payroll_with_churn <- payroll_with_churn %>%
+  filter(fiscal_year != 2014)
+
+churn_agency <- payroll_with_churn[
+  ,
+  .(
+    headcount  = uniqueN(emp_key),                   # # distinct employees
+    churn_rate  = mean(churn_flag, na.rm = TRUE)     # % who left
+  ),
+  by = .(fiscal_year, agency_name)
+][
+  order(fiscal_year, agency_name)
+]
+
+#Filter out all the community boards
+churn_agency <- churn_agency %>%
+  filter(
+    ! grepl(
+        "^(BRONX|BROOKLYN|MANHATTAN|QUEENS|STATEN ISLAND) COMMUNITY (BOARD|BD)",
+        agency_name,
+        ignore.case = TRUE
+      )
+  )
+
+
+#PLOTTING HEAT MAP FOR ALL AGENCIES
+# 1) get an ordered list of agencies
+all_agencies <- sort(unique(churn_agency$agency_name))
+
+# 2) split into chunks of 30
+agency_chunks <- split(
+  all_agencies,
+  ceiling(seq_along(all_agencies) / 30)
+)
+
+# 3) function to plot one chunk
+plot_chunk <- function(agencies, idx) {
+  p <- ggplot(
+      churn_agency[agency_name %in% agencies, ],
+      aes(
+        x = factor(fiscal_year),
+        y = agency_name,
+        fill = churn_rate
+      )
+    ) +
+    geom_tile() +
+    scale_fill_viridis_c(
+      name   = "Churn Rate",
+      labels = percent_format()
+    ) +
+    labs(
+      title = paste0("Agency Churn Heatmap (Agencies ", 
+                     (idx - 1) * 30 + 1, 
+                     "–", 
+                     min(idx * 30, length(all_agencies)), 
+                     ")"),
+      x     = "Fiscal Year",
+      y     = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid  = element_blank()
+    )
+  print(p)
+}
+
+plot_chunk(agency_chunks[[1]], 1)
+plot_chunk(agency_chunks[[2]], 2)
+plot_chunk(agency_chunks[[3]], 3)
+plot_chunk(agency_chunks[[4]], 4)
+
+
+#What are the largest departments?
+avg_dept_size <- churn_agency %>%
+  group_by(agency_name) %>%
+  summarise(
+    avg_headcount = mean(headcount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_headcount))
+print(avg_dept_size)
+
+
+#Largest departments that aren't for temporary workers:
+largest_departments <- c("POLICE DEPARTMENT", "FIRE DEPARTMENT", "DEPARTMENT OF EDUCATION ADMIN", "DEPT OF PARKS & RECREATION",
+                         "HRA/DEPT OF SOCIAL SERVICES", "NYC HOUSING AUTHORITY", "DEPARTMENT OF SANITATION", "DEPARTMENT OF CORRECTION",
+                         "ADMIN FOR CHILDREN'S SVCS", "DEPT OF HEALTH/MENTAL HYGIENE", "DEPT OF ENVIRONMENT PROTECTION", "DEPARTMENT OF
+                         TRANSPORTATION")
+
+p_largest_departments <- ggplot(
+      churn_agency[agency_name %in% largest_departments, ],
+      aes(
+        x = factor(fiscal_year),
+        y = agency_name,
+        fill = churn_rate
+      )
+    ) +
+    geom_tile() +
+    scale_fill_viridis_c(
+      name   = "Churn Rate",
+      labels = percent_format()
+    ) +
+    labs(
+      title = paste0("Agency Churn Heatmap: Largest Agencies"),
+      x     = "Fiscal Year",
+      y     = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid  = element_blank()
+    )
+print(p_largest_departments)
+
+filtered_churn <- churn_agency %>%
+  filter(agency_name %in% largest_departments)
+
+agency_churn_var <- filtered_churn %>%
+  group_by(agency_name) %>%
+  summarise(
+    var_churn = var(churn_rate, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(var_churn))
+print(agency_churn_var)
+#LARGEST VARIATION IN CHURN: Parks and Rec, Sanitation, Corrections
+```
+
+```{r}
+chosen_departments <- c("DEPT OF PARKS & RECREATION", "DEPARTMENT OF SANITATION", "DEPARTMENT OF CORRECTION")
+
+chosen_departments_visual <- churn_agency %>%
+  filter(agency_name %in% chosen_departments)
+
+#MAKE SURE THIS GRAPH IS RIGHT - no da stuff
+ggplot(chosen_departments_visual, aes(x = fiscal_year, y = churn_rate, color = agency_name)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(
+    breaks = sort(unique(chosen_departments_visual$fiscal_year)),  # one tick per year
+    minor_breaks = NULL
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Churn Rate Over Time for Largest Departments",
+    x     = "Fiscal Year",
+    y     = "Churn Rate",
+    color = "Office"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+
+payroll_final <- payroll_with_churn[
+  agency_name %in% c(
+    "DEPT OF PARKS & RECREATION",
+    "DEPARTMENT OF SANITATION",
+    "DEPARTMENT OF CORRECTION"
+  )
+]
+
+
+#REMOVING TITLES WHERE CHURN = 100%
+title_year <- payroll_final[
+  , .(
+      churn_rate = mean(churn_flag, na.rm = TRUE),
+      years_present = uniqueN(fiscal_year)
+    ),
+  by = .(title_description, fiscal_year)
+]
+
+title_avg <- title_year[
+  ,
+  .(
+    avg_churn_rate = mean(churn_rate, na.rm = TRUE),  # average over years
+    n_years        = .N                                # number of years observed
+  ),
+  by = title_description
+][
+  order(-avg_churn_rate)
+]
+
+#Remove all where avg_churn_rate == 1
+#Temporary words: helper, trainee, intern -> remove all titles with these 
+# 1) Titles with perfect churn (avg_churn_rate == 1)
+full_churn_titles <- title_avg[avg_churn_rate == 1, title_description]
+
+# 2) Titles containing INTERN, HELPER, or TRAINEE
+temp_titles <- title_avg[
+  grepl("INTERN|HELPER|TRAINEE", title_description, ignore.case = TRUE),
+  title_description
+]
+
+payroll_final_clean <- payroll_final[
+  ! title_description %in% c(full_churn_titles, temp_titles)
+]
+#Removed around 2000 entries 
+#HERE'S THE CLEAR LOGIC ->
+#For people that only remain seasonal workers throughout their entire career at the agency - they will be entirely dropped
+#For people that transition from a seasonal role into a full time role, their entries will still be counted correctly
+#For people that transition from a full time role into a seasonal role, their entries may say not churned but they will disappear from the dataset -> COULD MANUALLY REMOVE THESE ENTRIES IF NECESSARY (but should not be too big of a problem given small n)
+
+
+#GUT CHECK: does the ratio of churned to unchurned make sense 
+tf <- table(payroll_final_clean$churn_flag, useNA = "no")
+print(tf)
+#26%
+
+
+#Question: How can titles that appear in the dataset for one year have an avg_churn_rate of 0.333?
+#Did these people transition to a full time role in the same agency -> some are not counted as churned while others are? 
+#^Look into the specific case of: AGENCY ATTORNEY INTERN
+#ANSWER: it's actually just 3 separate people across different agencies with that title in one year - which explains why avg_churn_rate can be 0.333
+
+unique(payroll_final$work_location_borough)
+#The only unique boroughs are: QUEENS, MANHATTAN, BRONX, BROOKLYN, WESTCHESTER, AND RICHMOND 
+```
+
+
+
+
+
+
+

@@ -1,0 +1,260 @@
+---
+title: "Feature Selection and Engineering"
+output: html_document
+date: "2025-05-09"
+---
+
+```{r}
+#0 - FACTORIZING PAY_BASIS
+unique(payroll_final_clean$pay_basis)
+tf <- table(payroll_final_clean$pay_basis, useNA = "no")
+print(tf)
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    pay_basis = factor(pay_basis)
+  )
+
+
+#1 - SENIORITY
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(agency_start_year = year(agency_start_date))
+
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    seniority = fiscal_year - agency_start_year
+  )
+
+#Sanity check
+payroll_final_clean %>% 
+  summarise(
+    min_seniority = min(seniority, na.rm = TRUE),
+    max_seniority = max(seniority, na.rm = TRUE),
+    mean_seniority = mean(seniority, na.rm = TRUE)
+  )
+#Min = 0, max = 70, mean = 8
+
+
+#2 - FACTORIZING THE BOROUGHS
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    work_location_borough = factor(work_location_borough)
+  )
+summary(payroll_final_clean$work_location_borough)
+
+
+#3 - BASE PAY CHANGE 
+#Calculated in terms of hourly wage
+#First have to convert to hourly and then calculate the pay bump by hour - standardized assumption of
+#2080 hours worked to calculate hourly bc need to determine the hourly wage they are OFFERED
+# assume full-time ≈ 40 hrs/week × 52 weeks = 2,080 hrs/year
+HOURS_PER_YEAR <- 40 * 52
+payroll_final_clean <- payroll_final_clean %>%
+  # 1) unified hourly rate
+  mutate(
+    hourly_rate = case_when(
+      pay_basis %in% c("per Annum", "Prorated Annual") ~ base_salary / HOURS_PER_YEAR,
+      pay_basis == "per Hour"                          ~ base_salary,
+      pay_basis == "per Day"                           ~ base_salary / 24,
+      TRUE                                             ~ NA_real_
+    )
+  ) %>%
+  # 2) signed change, but force first‐year NA → 0
+  arrange(emp_key, fiscal_year) %>%
+  group_by(emp_key) %>%
+  mutate(
+    hourly_change = coalesce(
+      hourly_rate - lag(hourly_rate),
+      0
+    )
+  ) %>%
+  ungroup()
+payroll_final_clean %>%
+  summarise(
+    mean_change   = mean(hourly_change,    na.rm = TRUE),
+    max_change    = max(hourly_change,     na.rm = TRUE),
+    min_change    = min(hourly_change,     na.rm = TRUE),
+    sd_change     = sd(hourly_change,      na.rm = TRUE)
+  )
+#min_change is -71? 
+#Looking at negative cases ->
+#Special case: ADALBERTO MORA
+test <- payroll_final_clean %>%
+  filter(first_name == "ADALBERTO", last_name == "MORA") %>%
+  pull(emp_key)
+print(test)
+#This individual genuinely did take a big pay cut 
+
+test2 <- payroll_final_clean %>%
+  filter(hourly_change == min(hourly_change)) %>%
+  pull(emp_key)
+print(test2)
+#Feels like a situation where the person took a lesser paying role (their agency-start-date also changed) and then eventually returned
+#to their original role
+#For these types of entries, the hourly_change will be noisy
+#It's hard to tell if these are genuinely different people or just someone who wanted to take a lesser role while
+#They were dealing with something else in life like having a baby - so don't separate out as negative, instead COERCE INTO 0
+
+#Same column but coerce negatives to 0
+payroll_final_clean <- payroll_final_clean %>%
+  # 1) unified hourly rate
+  mutate(
+    hourly_rate = case_when(
+      pay_basis %in% c("per Annum", "Prorated Annual") ~ base_salary / HOURS_PER_YEAR,
+      pay_basis == "per Hour"                          ~ base_salary,
+      pay_basis == "per Day"                           ~ base_salary / 24,
+      TRUE                                             ~ NA_real_
+    )
+  ) %>%
+  # 2) year‐over‐year change, zero‐clamp both first‐year & negative dips
+  arrange(emp_key, fiscal_year) %>%
+  group_by(emp_key) %>%
+  mutate(
+    hourly_change     = coalesce(hourly_rate - lag(hourly_rate), 0),
+    hourly_change_pos = pmax(hourly_change, 0)
+  ) %>%
+  ungroup()
+payroll_final_clean %>%
+  summarise(
+    mean_change   = mean(hourly_change_pos,    na.rm = TRUE),
+    max_change    = max(hourly_change_pos,     na.rm = TRUE),
+    min_change    = min(hourly_change_pos,     na.rm = TRUE),
+    sd_change     = sd(hourly_change_pos,      na.rm = TRUE)
+  )
+#mean_change is around the same here meaning negatives should not have too much of an effect in the non pos version 
+ggplot(payroll_final_clean, aes(x = hourly_change_pos)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of Hourly Change Positive",
+    x     = "Hourly Change Positive",
+    y     = "Count"
+  )
+
+#LOG TRANSFORMATION
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    hourly_change_pos_log = log1p(hourly_change_pos)
+  )
+ggplot(payroll_final_clean, aes(x = hourly_change_pos_log)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of Hourly Change Positive Log",
+    x     = "Hourly Change Positive Log",
+    y     = "Count"
+  )
+
+
+#4 and 5 - ot_hours
+#CREATING 2 additional features here - 1) difference between this year's ot_hours and last year's ot_hours 2) ratio between this year's ot_hours and 3 year MA of the LAST 3 years (did not end up using this second feature)
+payroll_final_clean <- payroll_final_clean %>%
+  arrange(emp_key, fiscal_year) %>%
+  group_by(emp_key) %>%
+  mutate(
+    # 1) YoY change, with first‐year → 0
+    ot_hours_change = coalesce(
+      ot_hours - lag(ot_hours, order_by = fiscal_year),
+      0
+    ),
+
+    # 2) Past‐looking 3-yr MA of OT hours
+    ot_hours_ma3_prev = rollapply(
+      lag(ot_hours, order_by = fiscal_year),
+      width = 3,
+      FUN   = mean,
+      align = "right",
+      fill  = NA,
+      na.rm = TRUE
+    ),
+
+    # 3) Ratio, but only when the MA is > 0; otherwise NA
+    ot_vs_ma3_prev = case_when(
+      ot_hours_ma3_prev > 0 ~ ot_hours / ot_hours_ma3_prev,
+      TRUE                  ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+# Histogram of the year-over-year OT hours change
+ggplot(payroll_final_clean, aes(x = ot_hours_change)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of Year-Over-Year OT Hours Change",
+    x     = "OT Hours Change",
+    y     = "Count"
+  )
+# Histogram of the OT vs. 3-yr MA ratio
+ggplot(payroll_final_clean, aes(x = ot_vs_ma3_prev)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of OT vs. 3-Year Moving Average Ratio",
+    x     = "OT / 3-Year MA",
+    y     = "Count"
+  )
+payroll_final_clean %>%
+  summarise(
+    max_ot_vs_ma3_prev = max(ot_vs_ma3_prev, na.rm = TRUE),
+    min_ot_vs_ma3_prev = min(ot_vs_ma3_prev, na.rm = TRUE),
+    mean_ot_vs_ma3_prev = mean(ot_vs_ma3_prev, na.rm = TRUE),
+    sd_ot_vs_ma3_prev   = sd(ot_vs_ma3_prev, na.rm = TRUE),
+    n_na                = sum(is.na(ot_vs_ma3_prev)),
+    n_nan               = sum(is.nan(ot_vs_ma3_prev)),
+    n_inf               = sum(is.infinite(ot_vs_ma3_prev))
+  )
+
+#SIGNED LOG TRANSFORMATION (collapses extreme values and makes both tails more symmetric)
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    ot_change_signed_log = sign(ot_hours_change) * log1p(abs(ot_hours_change))
+  )
+ggplot(payroll_final_clean, aes(x = ot_change_signed_log)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of OT Signed Log",
+    x     = "OT Signed Log",
+    y     = "Count"
+  )
+
+
+#6 - total_ot_paid (as opposed to ot_hours, this variable makes it so the model can understand how much overtime an employee works relative to 
+#other employees)
+payroll_final_clean <- payroll_final_clean %>%
+  group_by(fiscal_year) %>%
+  mutate(
+    # Quintile buckets 1–5
+    ot_pay_quintile   = ntile(total_ot_paid, 5)
+
+    # Z-score within year (mean=0, sd=1)
+    #ot_pay_zscore   = (total_ot_paid - mean(total_ot_paid, na.rm=TRUE)) / 
+    #                   sd(total_ot_paid, na.rm=TRUE)
+  ) %>%
+  ungroup()
+ggplot(payroll_final_clean, aes(x = ot_pay_zscore)) +
+  geom_histogram() +
+  labs(
+    title = "Histogram of OT Pay Zscore",
+    x     = "OT Pay Zscore",
+    y     = "Count"
+  )
+
+
+#7 - binary column for whether total_other_pay was negative
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    other_pay_negative = if_else(total_other_pay < 0, 1L, 0L)
+  )
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    other_pay_negative = factor(
+      other_pay_negative,
+      levels = c(0L, 1L)
+    )
+  )
+
+
+#Factoring agency name
+payroll_final_clean <- payroll_final_clean %>%
+  mutate(
+    agency_name = factor(agency_name)
+  )
+
+#370,271 in my final dataset
+```
+
